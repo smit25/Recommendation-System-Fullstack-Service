@@ -1,0 +1,27 @@
+{
+  "timestamp": "2025-04-26T21:53:28.888282",
+  "execution_time_seconds": 149.3895378112793,
+  "detection_results": {
+    "suspicious_user_count": 2,
+    "suspicious_users": [
+      {
+        "user_id": "215120",
+        "flags": [
+          "high_request_volume",
+          "low_engagement"
+        ],
+        "request_count": 55,
+        "watch_rate": 0.0
+      },
+      {
+        "user_id": "21512",
+        "flags": [
+          "high_request_volume",
+          "low_engagement"
+        ],
+        "request_count": 51,
+        "watch_rate": 0.0
+      }
+    ]
+  }
+}

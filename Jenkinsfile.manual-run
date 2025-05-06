@@ -1,0 +1,225 @@
+pipeline {
+    agent any
+    
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+    }
+    
+    environment {
+        CONDA_ENV_NAME = 'ml-api-env'
+        CONDA_PATH = '/home/hmulchan/miniconda3'
+        GIT_CREDENTIALS = credentials('github-token-2')
+        APP_VERSION = '' // Automatically set by bash file
+    }
+    
+    stages {
+       stage('Checkout') {
+            steps {
+                checkout scm
+                // Configure Git to use a credentials file for Git LFS
+                withCredentials([usernamePassword(credentialsId: 'github-token-2', usernameVariable: 'GIT_USERNAME', passwordVariable: 'GIT_PASSWORD')]) {
+                    sh '''
+                        # Set up a Git credentials file in the workspace
+                        git config credential.helper "store --file=.git-credentials"
+                        # Write the credentials for GitHub to the credentials file.
+                        # Adjust the URL if needed. This example uses GitHub.com.
+                        echo "https://${GIT_USERNAME}:${GIT_PASSWORD}@github.com/cmu-seai/group-project-s25-backprop-to-the-future" > .git-credentials
+                        # Now pull Git LFS files using the stored credentials
+                        git lfs pull
+                    '''
+                }
+            }
+        }
+        
+        stage('Fix Requirements') {
+            steps {
+                // Create a fixed requirements file if needed
+                sh '''
+                    # Check if requirements.txt exists
+                    if [ -f "requirements.txt" ]; then
+                        # Backup original requirements
+                        cp requirements.txt requirements.txt.original
+                        
+                        # Fix any problematic version constraints
+                        cat requirements.txt | sed -E 's/numpy==2\\.2\\.3/numpy>=1.20.0/g' | sed -E 's/scipy==1\\.15\\.2/scipy>=1.7.0/g' > requirements_fixed.txt
+                        mv requirements_fixed.txt requirements.txt
+                        
+                        echo "Modified requirements.txt:"
+                        cat requirements.txt
+                    fi
+                '''
+            }
+        }
+        
+        stage('Setup Python Environment') {
+            steps {
+                sh """
+                    # Use the conda.sh script to properly activate environments
+                    export PATH=\${CONDA_PATH}/bin:\$PATH
+                    
+                    # Remove environment if it exists
+                    \${CONDA_PATH}/bin/conda env remove -n ${CONDA_ENV_NAME} -y || true
+                    
+                    # Create new environment with key packages
+                    \${CONDA_PATH}/bin/conda create -n ${CONDA_ENV_NAME} python=3.9 numpy scipy pandas flask -y
+                    
+                    # Install required packages using conda source script
+                    . \${CONDA_PATH}/etc/profile.d/conda.sh
+                    conda activate ${CONDA_ENV_NAME}
+                    
+                    # Install remaining requirements with relaxed dependencies
+                    if [ -f "requirements.txt" ]; then
+                        # Use --no-deps to avoid dependency conflicts
+                        pip install -r requirements.txt --no-deps || echo "Some packages couldn't be installed, continuing anyway"
+                        
+                        # Install essential packages
+                        pip install scikit-learn pytest coverage
+                    fi
+                """
+            }
+        }
+        
+        stage('List Installed Packages') {
+            steps {
+                sh """
+                    # Source conda.sh to enable conda activate
+                    . \${CONDA_PATH}/etc/profile.d/conda.sh
+                    conda activate ${CONDA_ENV_NAME}
+                    
+                    # List installed packages
+                    pip list
+                """
+            }
+        }
+
+
+         stage('Increment Version') {
+            steps {
+                script {
+                    def version = sh(script: './increment_version.sh minor', returnStdout: true).trim()
+                    echo "Version updated to ${version}"
+                    env.APP_VERSION = version
+                }
+            }
+         }               
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    
+                        def newversion = sh(script: "grep 'current_version:' version.yaml | cut -d ':' -f2 | xargs", returnStdout: true).trim()
+                        echo "Previous version: ${newversion}"
+                        env.APP_VERSION = newversion
+                        echo "Building Flask App Docker Image with version ${env.APP_VERSION}..."
+                        sh "sudo docker build -t flask-app ."
+                
+                }
+            }
+        }
+        stage('Deploy Docker Containers') {
+            steps {
+                echo "Deploying the new version..."
+                sh '''
+                echo "Checking if rolling-update.sh exists..."
+                if [ ! -f ./rolling-update.sh ]; then
+                    echo "ERROR: rolling-update.sh not found in workspace root!"
+                    ls -la
+                    exit 1
+                fi
+
+                echo "Making script executable and running it..."
+                chmod +x ./rolling-update.sh
+                sudo ./rolling-update.sh
+            '''
+            }
+        }
+/*
+        stage('Find Tests') {
+            steps {
+                sh """
+                    # Find all test files
+                    echo "Looking for test files with pattern *_test.py"
+                    find . -name "*_test.py" -type f || echo "No test files found"
+                    
+                    echo "Looking for alternative test patterns"
+                    find . -name "test_*.py" -type f || echo "No test_*.py files found"
+                    find . -path "tests.py" -type f || echo "No files in tests directories found"
+                """
+            }
+        }
+        
+        stage('Run Tests') {
+            steps {
+                sh """
+                    # Source conda.sh to enable conda activate
+                    . \${CONDA_PATH}/etc/profile.d/conda.sh
+                    conda activate ${CONDA_ENV_NAME}
+                    
+                    # Create directory for test results
+                    mkdir -p test-reports
+                    
+                    # Get current directory structure
+                    echo "Directory structure:"
+                    ls -la
+                    
+                    # Run tests with different patterns
+                    echo "Running tests with pattern *_test.py"
+                    python -m unittest discover -p "*_test.py" || echo "Tests failed or not found, continuing anyway"
+                    
+                    echo "Running tests with pattern test_*.py"
+                    python -m unittest discover -p "test_*.py" || echo "Tests failed or not found, continuing anyway"
+                """
+            }
+        }
+        stage('Generate Coverage Report') {
+            steps {
+                sh """
+                    # Source conda.sh to enable conda activate
+                    . \${CONDA_PATH}/etc/profile.d/conda.sh
+                    conda activate ${CONDA_ENV_NAME}
+                    
+                    # Create directory for coverage reports
+                    mkdir -p coverage-reports/html
+                    
+                    # Run coverage specifically on test_*.py since that pattern found tests
+                    echo "Running coverage on test_*.py"
+                    coverage run -m unittest discover -p "test_*.py"
+                    
+                    # Generate coverage reports
+                    coverage xml -o coverage-reports/coverage.xml || echo "Failed to generate XML report"
+                    coverage html -d coverage-reports/html || echo "Failed to generate HTML report"
+                    coverage report > coverage-reports/coverage.txt || echo "Failed to generate text report"
+                    
+                    # Ensure HTML report directory exists with at least an index file
+                    if [ ! -f coverage-reports/html/index.html ]; then
+                        echo "<html><body><h1>Coverage Report</h1><p>Tests were run but no coverage data was collected.</p></body></html>" > coverage-reports/html/index.html
+                    fi
+                """
+                
+                // Archive coverage artifacts
+                archiveArtifacts artifacts: 'coverage-reports/**', allowEmptyArchive: true
+            }
+        }
+    }
+    
+    post {
+        always {
+            publishHTML(target: [
+                allowMissing: true,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: 'coverage-reports/html',
+                reportFiles: 'index.html',
+                reportName: 'Coverage Report'
+            ])
+        }
+      
+        success {
+            echo "Pipeline completed successfully"
+        }
+        
+        failure {
+            echo "Pipeline failed"
+        }
+*/
+    }
+}

@@ -1,0 +1,118 @@
+pipeline {
+    agent any
+    
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+    }
+    
+    environment {
+        CONDA_ENV_NAME = 'project_env'
+        CONDA_PATH = '/home/hmulchan/miniconda3'
+        GIT_CREDENTIALS = credentials('github-token-2')
+        APP_VERSION = '' // Automatically set by bash file
+        OLD_APP_VERSION = '' // Automatically set by bash script
+    }
+    
+    stages {
+       stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        stage('Get Previous version'){
+            steps{
+                script{
+                    def oldversion = sh(script: "grep 'current_version:' version.yaml | cut -d ':' -f2 | xargs", returnStdout: true).trim()
+                    echo "Previous version: ${oldversion}"
+                    env.OLD_APP_VERSION = oldversion
+                }
+            }
+        }
+
+        stage('Read Kafka') {
+            steps {
+                script {
+                    sh """
+                        # Activate the virtual environment
+                        . \${CONDA_PATH}/etc/profile.d/conda.sh
+                        conda activate ${CONDA_ENV_NAME}
+                        
+                        python3 kafka_read.py
+                        echo "Ran kafka_read file"
+
+                        python3 clean_data.py
+                        echo "Ran clean_data file"
+                    """
+                }
+            }
+        }
+
+        stage('Train Model with Cron Job') {
+            steps {
+                script {
+                    sh """
+                        echo "Training model and updating version"
+                        chmod +x model_training_cron.sh
+                        ./model_training_cron.sh
+                    """
+                }
+            }
+        }
+        stage('Get latest Version') {
+            steps {
+                script {
+                    def newversion = sh(script: "grep 'current_version:' version.yaml | cut -d ':' -f2 | xargs", returnStdout: true).trim()
+                    echo "Previous version: ${newversion}"
+                    env.APP_VERSION = newversion
+                }
+            }
+        }
+               
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    echo "Building Flask App Docker Image with version ${env.APP_VERSION}..."
+                    sh "sudo docker build -t flask-app:${env.APP_VERSION} ."
+                }
+            }
+        }
+        stage('Deploy Docker Containers') {
+            steps {
+                echo "Deploying the new version..."
+                sh '''
+                echo "Checking if rolling-update.sh exists..."
+                if [ ! -f ./deployment.sh ]; then
+                    echo "ERROR: rolling-update.sh not found in workspace root!"
+                    ls -la
+                    exit 1
+                fi
+
+                echo "Making script executable and running it..."
+                chmod +x ./deployment.sh
+                sudo ./deployment.sh
+            '''
+            }
+        }
+    }
+    
+    post {
+        always {
+            publishHTML(target: [
+                allowMissing: true,
+                alwaysLinkToLastBuild: true,
+                keepAll: true,
+                reportDir: 'coverage-reports/html',
+                reportFiles: 'index.html',
+                reportName: 'Coverage Report'
+            ])
+        }
+    
+        success {
+            echo "Pipeline completed successfully"
+        }
+        
+        failure {
+            echo "Pipeline failed"
+        }
+    } 
+}
